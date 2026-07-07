@@ -467,6 +467,10 @@ async fn start_server(
         println!("Custom models directory: {}", dir);
     }
 
+    // Lavoce credential seam: load Azure STT + FreeLLMAPI keys from the
+    // per-user file and inject them into the sidecar's environment.
+    let creds = load_lavoce_credentials();
+
     // If CUDA binary exists, launch it from the onedir directory.
     // .current_dir() is critical: PyInstaller onedir expects all DLLs and
     // support files (nvidia/, _internal/, etc.) relative to the exe.
@@ -482,6 +486,9 @@ async fn start_server(
         if let Some(ref dir) = effective_models_dir {
             cmd = cmd.env("VOICEBOX_MODELS_DIR", dir);
         }
+        for (k, v) in &creds {
+            cmd = cmd.env(k, v);
+        }
         cmd.spawn()
     } else {
         // Use the bundled CPU sidecar
@@ -491,6 +498,9 @@ async fn start_server(
         }
         if let Some(ref dir) = effective_models_dir {
             sidecar = sidecar.env("VOICEBOX_MODELS_DIR", dir);
+        }
+        for (k, v) in &creds {
+            sidecar = sidecar.env(k, v);
         }
         println!("Spawning server process...");
         sidecar.spawn()
@@ -1255,7 +1265,7 @@ pub fn run() {
             #[cfg(desktop)]
             {
                 let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-                let show_i = MenuItem::with_id(app, "show", "Show Voicebox", true, None::<&str>)?;
+                let show_i = MenuItem::with_id(app, "show", "Show Lavoce", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
 
                 let _tray = TrayIconBuilder::new()
@@ -1421,52 +1431,15 @@ pub fn run() {
             update_chord_bindings,
             hide_main_window
         ])
-        .on_window_event({
-            let closing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            move |window, event| {
+        .on_window_event(|window, event| {
+            // Background dictation service: closing the window hides it to the
+            // tray and keeps the sidecar + global hotkey running. The app quits
+            // only via the tray menu's Quit item.
             if let WindowEvent::CloseRequested { api, .. } = event {
-                // If we're already in the close flow, let it proceed
-                if closing.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                closing.store(true, std::sync::atomic::Ordering::SeqCst);
-
-                // Prevent automatic close so frontend can clean up
                 api.prevent_close();
-
-                // Emit event to frontend to check setting and stop server if needed
-                let app_handle = window.app_handle();
-
-                if let Err(e) = app_handle.emit("window-close-requested", ()) {
-                    eprintln!("Failed to emit window-close-requested event: {}", e);
-                    window.close().ok();
-                    return;
-                }
-
-                // Set up listener for frontend response
-                let window_for_close = window.clone();
-                let closing_for_timeout = closing.clone();
-                let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-
-                let listener_id = window.listen("window-close-allowed", move |_| {
-                    let _ = tx.send(());
-                });
-
-                tauri::async_runtime::spawn(async move {
-                    tokio::select! {
-                        _ = rx.recv() => {
-                            window_for_close.close().ok();
-                        }
-                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
-                            eprintln!("Window close timeout, closing anyway");
-                            window_for_close.close().ok();
-                        }
-                    }
-                    window_for_close.unlisten(listener_id);
-                    closing_for_timeout.store(false, std::sync::atomic::Ordering::SeqCst);
-                });
+                let _ = window.hide();
             }
-        }})
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
@@ -1545,4 +1518,69 @@ pub fn run() {
 
 fn main() {
     run();
+}
+
+// --- Lavoce credential seam ---
+// Credentials live in a per-user file, never in the binary. On Windows that's
+// %APPDATA%\lavoce\.env; elsewhere ~/.config/lavoce/.env. The Rust launcher
+// reads them and injects VOICEBOX_* env vars into the Python sidecar at spawn
+// (the Python side uses os.environ.setdefault, so injected values win).
+
+fn lavoce_env_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return std::path::PathBuf::from(appdata).join("lavoce").join(".env");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home)
+                .join(".config")
+                .join("lavoce")
+                .join(".env");
+        }
+    }
+    std::path::PathBuf::from(".env")
+}
+
+fn load_lavoce_credentials() -> Vec<(String, String)> {
+    let path = lavoce_env_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if !path.exists() {
+        // First run: drop a template so the user knows exactly where to add keys.
+        let template = "# Lavoce credentials — fill in and restart Lavoce.\n\
+VOICEBOX_MICROSOFT_STT_ENDPOINT=\n\
+VOICEBOX_MICROSOFT_STT_KEY=\n\
+VOICEBOX_MICROSOFT_STT_LOCALE=en-US\n\
+VOICEBOX_FREELLMAPI_URL=\n\
+VOICEBOX_FREELLMAPI_KEY=\n\
+VOICEBOX_FREELLMAPI_MODEL=auto\n";
+        let _ = std::fs::write(&path, template);
+        println!("Lavoce: wrote credential template to {:?}", path);
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || !line.contains('=') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                let v = v.trim().trim_matches('"').trim_matches('\'');
+                if k.starts_with("VOICEBOX_") && !v.is_empty() {
+                    out.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+    }
+    println!("Lavoce: loaded {} credential var(s) from {:?}", out.len(), path);
+    out
 }
