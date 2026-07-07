@@ -1,0 +1,19 @@
+# Lavoce backend — thin remote client (Azure STT + FreeLLMAPI). No local models.
+
+# FastAPI and server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# Audio (capture decode / duration only — no librosa/numba)
+soundfile>=0.12.0
+numpy>=1.24.0,<2.0
+
+# HTTP client (Azure Speech + FreeLLMAPI)
+httpx>=0.27.0
+
+# Multipart uploads (capture/transcribe endpoints)
+python-multipart>=0.0.6
